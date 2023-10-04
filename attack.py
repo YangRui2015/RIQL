@@ -16,7 +16,7 @@ NAME_DICT = {
 }
 
 MODEL_PATH = {
-    "EDAC": "model_path_for_attack",
+    "EDAC": "./pretrained_model/EDAC/EDAC_baseline_seed0-",  ### to be added
 }
 
 dataset_path = "./adversarial_data/"
@@ -88,93 +88,31 @@ class Attack:
     def load_model(self):
         model_path = self.model_path
         state_dict = torch.load(model_path, map_location=self.device)
-        if self.agent_name == "IQL":
-            from IQL_adversarial import GaussianPolicy, DeterministicPolicy, TwinQ
+      
+        assert self.agent_name == "EDAC"
+        from EDAC import Actor, VectorizedCritic
 
-            self.actor = (
-                DeterministicPolicy(
-                    self.state_dim, self.action_dim, self.max_action, n_hidden=2
-                )
-                .to(self.device)
-                .eval()
+        self.actor = (
+            Actor(
+                self.state_dim,
+                self.action_dim,
+                hidden_dim=256,
+                max_action=self.max_action,
             )
-            self.critic = (
-                TwinQ(self.state_dim, self.action_dim, n_hidden=2)
-                .to(self.device)
-                .eval()
-            )
-            self.actor.load_state_dict(state_dict["actor"])
-            self.critic.load_state_dict(state_dict["qf"])
-        elif self.agent_name == "CQL":
-            from CQL import TanhGaussianPolicy, CriticFunctions
-
-            self.actor = (
-                TanhGaussianPolicy(
-                    self.state_dim,
-                    self.action_dim,
-                    max_action=self.max_action,
-                    orthogonal_init=True,
-                )
-                .to(self.device)
-                .eval()
-            )
-            self.critic = (
-                CriticFunctions(self.state_dim, self.action_dim, orthogonal_init=True)
-                .to(self.device)
-                .eval()
-            )
-            self.actor.load_state_dict(state_dict["actor"])
-            self.critic.critic_1.load_state_dict(state_dict["critic1"])
-            self.critic.critic_2.load_state_dict(state_dict["critic2"])
-        elif self.agent_name == "EDAC":
-            from EDAC import Actor, VectorizedCritic
-
-            self.actor = (
-                Actor(
-                    self.state_dim,
-                    self.action_dim,
-                    hidden_dim=256,
-                    n_hidden=2,
-                    max_action=self.max_action,
-                )
-                .to(self.device)
-                .eval()
-            )
-            self.critic = (
-                VectorizedCritic(self.state_dim, self.action_dim, hidden_dim=256)
-                .to(self.device)
-                .eval()
-            )
-            self.actor.load_state_dict(state_dict["actor"])
-            self.critic.load_state_dict(state_dict["critic"])
-        elif self.agent_name == "MSG":
-            from MSG import Actor, VectorizedCritic
-
-            self.actor = (
-                Actor(
-                    self.state_dim,
-                    self.action_dim,
-                    hidden_dim=256,
-                    n_hidden=2,
-                    max_action=self.max_action,
-                )
-                .to(self.device)
-                .eval()
-            )
-            self.critic = (
-                VectorizedCritic(self.state_dim, self.action_dim, hidden_dim=256)
-                .to(self.device)
-                .eval()
-            )
-            self.actor.load_state_dict(state_dict["actor"])
-            self.critic.load_state_dict(state_dict["critic"])
-        else:
-            raise NotImplementedError
+            .to(self.device)
+            .eval()
+        )
+        self.critic = (
+            VectorizedCritic(self.state_dim, self.action_dim, num_critics=10, hidden_dim=256)
+            .to(self.device)
+            .eval()
+        )
+        self.actor.load_state_dict(state_dict["actor"])
+        self.critic.load_state_dict(state_dict["critic"])
         print(f"Load model from {model_path}")
 
     
     def sample_indexs(self):
-        # if indexs is None:
         indexs = np.arange(len(self.dataset["rewards"]))
         random_num = self._np_rng.random(len(indexs))
         attacked = np.where(random_num < self.corruption_rate)[0]
@@ -216,8 +154,8 @@ class Attack:
 
     def loss_Q_for_next_obs(self, para, observation, action, std):
         noised_obs = observation + para * std
-        action = self.actor(noised_obs).detach()
-        qvalue = self.critic(observation, action)
+        action = self.actor(noised_obs)
+        qvalue = self.critic(noised_obs, action)
         return qvalue.mean()
 
     def loss_Q_for_rew(self):
@@ -257,7 +195,6 @@ class Attack:
                 raise NotImplementedError
 
             pointer += number
-
         return attack_data
 
     
@@ -406,10 +343,10 @@ def attack_dataset(config, dataset, use_original=False):
         env_name=config.env_name,
         agent_name=corruption_agent,
         dataset=dataset,
-        model_path=MODEL_PATH[corruption_agent],
+        model_path=MODEL_PATH[corruption_agent] + config.env_name + '/2999.pt',
         dataset_path=dataset_path, 
         resample_indexs=True,
-        force_attack=False , 
+        force_attack=False, 
         device=config.device,
         seed=config.train_seed,
     )
@@ -422,25 +359,25 @@ def attack_dataset(config, dataset, use_original=False):
     name = ""
     #### the ori_dataset refers to the part of unattacked data
     ### the att_dataset refers to attacked data + unattacked data
-    if config.corruption_obs:
+    if config.corrupt_obs:
         name += "obs_"
         attack_agent.set_attack_config(name, "obs", **attack_params)
         ori_dataset, att_dataset = attack_agent.attack(dataset)
         dataset = ori_dataset if use_original else att_dataset
 
-    if config.corruption_acts:
+    if config.corrupt_acts:
         name += "act_"
         attack_agent.set_attack_config(name, "act", **attack_params)
         ori_dataset, att_dataset = attack_agent.attack(dataset)
         dataset = ori_dataset if use_original else att_dataset
 
-    if config.corruption_reward:
+    if config.corrupt_reward:
         name += "rew_"
         attack_agent.set_attack_config(name, "rew", **attack_params)
         ori_dataset, att_dataset = attack_agent.attack(dataset)
         dataset = ori_dataset if use_original else att_dataset
 
-    if config.corruption_dynamics:
+    if config.corrupt_dynamics:
         name += "next_obs_"
         attack_agent.set_attack_config(name, "next_obs", **attack_params)
         ori_dataset, att_dataset = attack_agent.attack(dataset)

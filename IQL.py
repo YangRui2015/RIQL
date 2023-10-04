@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import wandb
 from tqdm import trange
+from attack import attack_dataset
 
 TensorBatch = List[torch.Tensor]
 
@@ -61,24 +62,21 @@ class TrainConfig:
     iql_tau: float = 0.7  # Coefficient for asymmetric loss
     iql_deterministic: bool = True  # Use deterministic actor
     normalize: bool = False # Normalize states
-    normalize_reward: bool = False  # Normalize reward
     # Wandb logging
-    project: str = "Corrupt_RIQL_SCALE2"
-    # project: str = "Model_Prepare"
+    project: str = "Robust_Offline_RL"
     group: str = "IQL"
     name: str = "IQL"
-    # env: str = "halfcheetah-medium-v2"  
     env_name: str = 'walker2d-medium-replay-v2' 
-    train_seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
+    train_seed: int = 0  
     eval_seed: int = 42
     flag: str = 'IQL'
 
     ###### corruption
-    corruption_reward: bool = False
-    corruption_dynamics: bool = False
-    corruption_obs: bool = False
-    corruption_acts: bool = False
-    random_corruption: bool = False
+    corrupt_reward: bool = False
+    corrupt_dynamics: bool = False
+    corrupt_obs: bool = False
+    corrupt_acts: bool = False
+    corruption_mode: str = 'random'
     corruption_range: float = 0.5
     corruption_rate: float = 0.1  
 
@@ -206,7 +204,7 @@ def wandb_init(config: dict) -> None:
         name=config["name"],
         id=str(uuid.uuid4()),
     )
-    # wandb.run.save()
+
 
 
 @torch.no_grad()
@@ -431,70 +429,6 @@ class ImplicitQLearning:
 
         self.total_it = 0
         self.device = device
-        self.clip_max = 50
-    
-    # def _get_kai(self, x, N):
-    #     mean_x = np.mean(x)
-    #     residual = x - mean_x
-    #     kai = N * np.sum(residual ** 4) / (np.sum(residual ** 2) ** 2)
-    #     return kai
-    
-    # def _save_values(self, x, N, name):
-    #     import pickle
-    #     hist, bins = np.histogram(x, bins=200)
-    #     kai = self._get_kai(x, N)
-    #     save_dict = {"hist": hist, "bins": bins, "kai": kai}
-    #     with open(os.path.join(TrainConfig.checkpoints_path, '{}.pkl'.format(name)), 'wb') as f:
-    #         pickle.dump(save_dict, f)
-
-
-    # def check_values(self, batch, epoch):
-    #     (
-    #         observations,
-    #         actions,
-    #         rewards,
-    #         next_observations,
-    #         dones,
-    #     ) = batch
-    #     with torch.no_grad():
-    #         target_q = self.q_target(observations, actions)
-    #         next_v = self.vf(next_observations)
-    #         v = self.vf(observations)
-    #         adv = target_q.detach() - v
-    #         v_loss = asymmetric_l2_loss(adv, self.iql_tau, keep_dim=True)
-
-    #     N = len(observations)
-    #     self._save_values(target_q.detach().cpu().numpy(), N, 'vtarget_epoch{}'.format(str(epoch)))
-    #     self._save_values(v.detach().cpu().numpy(), N, 'v_epoch{}'.format(str(epoch)))
-    #     self._save_values(v_loss.detach().cpu().numpy(), N, 'vloss_epoch{}'.format(str(epoch)))
-    #     self._save_values(adv.detach().cpu().numpy(), N, 'adv_epoch{}'.format(str(epoch)))
-
-        
-    #     rewards = rewards.squeeze(dim=-1)
-    #     dones = dones.squeeze(dim=-1)
-
-    #     with torch.no_grad():
-    #         targets = rewards + (1.0 - dones.float()) * self.discount * next_v.detach()
-    #         qs = self.qf.both(observations, actions)
-    #         q_mean = (qs[0] + qs[1]) / 2
-    #         q_loss = ((qs[0] - targets) ** 2 + (qs[1] - targets) ** 2) / len(qs)
-
-    #     self._save_values(targets.detach().cpu().numpy(), N, 'qtarget_epoch{}'.format(str(epoch)))
-    #     self._save_values(q_mean.detach().cpu().numpy(), N, 'q_epoch{}'.format(str(epoch)))
-    #     self._save_values(q_loss.detach().cpu().numpy(), N, 'qloss_epoch{}'.format(str(epoch)))
-
-
-    #     with torch.no_grad():
-    #         exp_adv = torch.exp(self.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-    #         policy_out = self.actor(observations)
-    #         bc_losses = torch.sum((policy_out - actions) ** 2, dim=1)
-    #         policy_loss = exp_adv * bc_losses
-
-    #     self._save_values(exp_adv.detach().cpu().numpy(), N, 'expadv_epoch{}'.format(str(epoch)))
-    #     self._save_values(bc_losses.detach().cpu().numpy(), N, 'bcloss_epoch{}'.format(str(epoch)))
-    #     self._save_values(policy_loss.detach().cpu().numpy(), N, 'policyloss_epoch{}'.format(str(epoch)))
-    
-
         
 
     def _update_v(self, observations, actions, log_dict) -> torch.Tensor:
@@ -504,8 +438,6 @@ class ImplicitQLearning:
 
         v = self.vf(observations)
         adv = target_q.detach() - v
-        ####################################### add clamp
-        # adv = torch.clamp(adv, -self.clip_max, self.clip_max)
         v_loss = asymmetric_l2_loss(adv, self.iql_tau)
 
         log_dict["value_loss"] = v_loss.item()
@@ -513,8 +445,6 @@ class ImplicitQLearning:
         log_dict["advantage_mean"] = torch.mean(adv).item()
         self.v_optimizer.zero_grad(set_to_none=True)
         v_loss.backward()
-        ############################ add clip norm
-        # torch.nn.utils.clip_grad_norm_(self.vf.parameters(), 1)
         self.v_optimizer.step()
         return adv
 
@@ -530,16 +460,11 @@ class ImplicitQLearning:
         targets = rewards + (1.0 - terminals.float()) * self.discount * next_v.detach()
         qs = self.qf.both(observations, actions)
         q_loss = sum(F.mse_loss(q, targets) for q in qs) / len(qs)
-        # q = self.qf(observations, actions)
-        # q_loss = F.mse_loss(q, targets) 
 
         log_dict["q_loss"] = q_loss.item()
         log_dict['q_mean'] = (torch.mean(qs[0]).item() + torch.mean(qs[1]).item()) / 2
-        # log_dict['q_mean'] = torch.mean(q).item()
         self.q_optimizer.zero_grad(set_to_none=True)
         q_loss.backward()
-        ############################ add clip norm
-        # torch.nn.utils.clip_grad_norm_(self.qf.parameters(), 1)
         self.q_optimizer.step()
 
         # Update target Q network
@@ -561,8 +486,6 @@ class ImplicitQLearning:
         log_dict["actor_loss"] = policy_loss.item()
         self.actor_optimizer.zero_grad(set_to_none=True)
         policy_loss.backward()
-        ############################ add clip norm
-        # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1)
         self.actor_optimizer.step()
         self.actor_lr_schedule.step()
 
@@ -587,7 +510,6 @@ class ImplicitQLearning:
         self._update_q(next_v, observations, actions, rewards, dones, log_dict)
         # Update actor
         self._update_policy(adv, observations, actions, log_dict)
-
         return log_dict
 
     def state_dict(self) -> Dict[str, Any]:
@@ -631,51 +553,8 @@ def train(config: TrainConfig):
     dataset = d4rl.qlearning_dataset(env)
 
     ##### corrupt
-    if (config.corruption_reward or config.corruption_dynamics or config.corruption_obs or config.corruption_acts):
-        if config.random_corruption:
-            print('random corruption')
-            random_num = np.random.random(dataset["rewards"].shape)
-            indexs = np.where(random_num < config.corruption_rate)
-            if config.corruption_dynamics: # corrupt dynamics
-                print('attack dynamics')
-                std = dataset["next_observations"].std(axis=0).reshape(1,state_dim)
-                dataset["next_observations"][indexs] += \
-                            np.random.uniform(-config.corruption_range, config.corruption_range, size=(indexs[0].shape[0], state_dim)) * std
-            
-            if config.corruption_reward: # corrupt rewards
-                print('attack reward')
-                dataset["rewards"][indexs] = \
-                            np.random.uniform(-config.corruption_range, config.corruption_range, size=indexs[0].shape[0])
-            
-            if config.corruption_obs:
-                print('attack observation')
-                std = dataset["observations"].std(axis=0).reshape(1,state_dim)
-                dataset["observations"][indexs] += np.random.uniform(-config.corruption_range, config.corruption_range, size=(indexs[0].shape[0], state_dim)) * std
-            
-            if config.corruption_acts:
-                print('attack actions')
-                std = dataset['actions'].std(axis=0).reshape(1, action_dim)
-                dataset["actions"][indexs] += np.random.uniform(-config.corruption_range, config.corruption_range, size=(indexs[0].shape[0], action_dim)) * std
-
-        else:
-            print('adversarial corruption')
-            if config.corruption_reward:
-                print('attack reward')
-                random_num = np.random.random(dataset["rewards"].shape)
-                indexs = np.where(random_num < config.corruption_rate)
-                # corrupt rewards
-                dataset["rewards"][indexs] *= - config.corruption_range
-            
-            if config.corruption_dynamics:
-                print('attack dynamics')
-                env_dir = 'walker2d_new_diverse' if config.env_name.startswith('walker2d') else 'halfcheetah'
-                print('loading path {}'.format(os.path.join('./log_attack_data/{}/'.format(env_dir), "attack_data_corrupt{}_rate{}.pt".format(config.corruption_range, config.corruption_rate))))
-                data_dict = torch.load(os.path.join('./log_attack_data/{}/'.format(env_dir), "attack_data_corrupt{}_rate{}.pt".format(config.corruption_range, config.corruption_rate)))
-                attack_indexs, next_observations  = data_dict['index'], data_dict['next_observations']
-                dataset["next_observations"][attack_indexs] = next_observations
-
-    if config.normalize_reward:
-        modify_reward(dataset, config.env_name)
+    if (config.corrupt_reward or config.corrupt_dynamics or config.corrupt_obs or config.corrupt_acts):
+        dataset, indexes = attack_dataset(config, dataset)
 
     if config.normalize:
         state_mean, state_std = compute_mean_std(np.concatenate([dataset["observations"], dataset['next_observations']], axis=0), eps=1e-3)
@@ -710,7 +589,7 @@ def train(config: TrainConfig):
 
 
     q_network = TwinQ(state_dim, action_dim).to(config.device)
-    # q_network = QFunction(state_dim, action_dim).to(config.device)
+    # q_network = QFunction(state_dim, action_dim).to(config.device) # for IQL with single Q function
     v_network = ValueFunction(state_dim).to(config.device)
     actor = (
         DeterministicPolicy(state_dim, action_dim, max_action)
@@ -799,12 +678,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', type=str, default='halfcheetah-medium-v2')
     parser.add_argument('--seed', type=int, default=0)
-    # parser.add_argument('--iql_deterministic', action='store_true', default=False)
-    parser.add_argument('--corruption_reward', action='store_true', default=False)
-    parser.add_argument('--corruption_dynamics', action='store_true', default=False)
-    parser.add_argument('--corruption_acts', action='store_true', default=False)
-    parser.add_argument('--corruption_obs', action='store_true', default=False)
-    parser.add_argument('--random_corruption', action='store_true', default=False)
+    parser.add_argument('--corrupt_reward', action='store_true', default=False)
+    parser.add_argument('--corrupt_dynamics', action='store_true', default=False)
+    parser.add_argument('--corrupt_acts', action='store_true', default=False)
+    parser.add_argument('--corrupt_obs', action='store_true', default=False)
+    parser.add_argument('--corruption_mode', type=str, default='random')
     parser.add_argument('--corruption_range', type=float, default=0.0)
     parser.add_argument('--corruption_rate', type=float, default=0.0)
     parser.add_argument('--checkpoints_path', type=str, default=None)
@@ -814,31 +692,29 @@ if __name__ == "__main__":
     ### modify config
     TrainConfig.env_name = args.env_name
     TrainConfig.train_seed = args.seed
-    # TrainConfig.iql_deterministic = args.iql_deterministic
-    TrainConfig.corruption_reward = args.corruption_reward
-    TrainConfig.corruption_dynamics = args.corruption_dynamics
-    TrainConfig.corruption_acts = args.corruption_acts
-    TrainConfig.corruption_obs = args.corruption_obs
+    TrainConfig.corrupt_reward = args.corrupt_reward
+    TrainConfig.corrupt_dynamics = args.corrupt_dynamics
+    TrainConfig.corrupt_acts = args.corrupt_acts
+    TrainConfig.corrupt_obs = args.corrupt_obs
     TrainConfig.random_corruption = args.random_corruption
     TrainConfig.corruption_range = args.corruption_range
     TrainConfig.corruption_rate = args.corruption_rate
     TrainConfig.checkpoints_path = args.checkpoints_path
 
     ## modify config
-    if TrainConfig.corruption_reward:
+    if TrainConfig.corrupt_reward:
         group_name_center = 'reward' 
-    elif TrainConfig.corruption_dynamics:
+    elif TrainConfig.corrupt_dynamics:
         group_name_center = 'dynamics'
-    elif TrainConfig.corruption_acts:
+    elif TrainConfig.corrupt_acts:
         group_name_center = 'actions'
-    elif TrainConfig.corruption_obs:
+    elif TrainConfig.corrupt_obs:
         group_name_center = 'observations'
     else:
         group_name_center = 'no_attack'
 
-    group_name_center = 'random_' + group_name_center if TrainConfig.random_corruption else 'adversarial_' + group_name_center
-    TrainConfig.group = TrainConfig.group + '-{}'.format(group_name_center) 
-    TrainConfig.group = TrainConfig.group + '_{}'.format(TrainConfig.env_name.split('-')[0])
+    group_name_center = '{}_'.format(TrainConfig.corruption_mode) + group_name_center 
+    TrainConfig.group = TrainConfig.group + '-{}'.format(group_name_center) + '_{}'.format(TrainConfig.env_name.split('-')[0])
     TrainConfig.name = "IQL_corrupt{}_{}_single_baseline_seed{}".format(TrainConfig.corruption_range, TrainConfig.corruption_rate, TrainConfig.train_seed)
     # TrainConfig.name = "IQL_corrupt{}_{}_baseline_norm2_seed{}".format(TrainConfig.corruption_range, TrainConfig.corruption_rate, TrainConfig.train_seed)
     TrainConfig.name = f"{TrainConfig.name}-{TrainConfig.env_name}-{str(uuid.uuid4())[:8]}"
