@@ -1,5 +1,3 @@
-# source: https://github.com/gwthomas/IQL-PyTorch
-# https://arxiv.org/pdf/2110.06169.pdf
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import copy
 from dataclasses import dataclass
@@ -47,7 +45,7 @@ class TrainConfig:
     eval_every: int = 10  
     log_every: int = 100
     n_episodes: int = 10 
-    device: str = 'cpu' #"cuda"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
     num_epochs: int = 3000     
     num_updates_on_epoch: int = 1000
     eval_freq: int = int(1e4)  # How often (time steps) we evaluate
@@ -59,7 +57,8 @@ class TrainConfig:
     buffer_size: int = 2_000_000  # Replay buffer size
     batch_size: int = 256  # Batch size for all networks
     discount: float = 0.99  # Discount factor
-    tau: float = 0.005  # Target network update rate
+    soft_target_update_rate: float = 0.005  # Target network update rate
+    learning_rate: float = 3e-4  # Learning rate for all networks
     beta: float = 3.0  # Inverse temperature. Small beta -> BC, big beta -> maximizing Q
     iql_tau: float = 0.7  # Coefficient for asymmetric loss
     iql_deterministic: bool = False  # Use deterministic actor
@@ -83,13 +82,13 @@ class TrainConfig:
     corrupt_obs: bool = False
     corrupt_acts: bool = False
     corruption_mode: str = 'random'
-    corruption_range: float = 0.5
-    corruption_rate: float = 0.1  
+    corruption_range: float = 1.0
+    corruption_rate: float = 0.3  
 
 
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
+def soft_update(target: nn.Module, source: nn.Module, soft_target_update_rate: float):
     for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
+        target_param.data.copy_((1 - soft_target_update_rate) * target_param.data + soft_target_update_rate * source_param.data)
 
 
 def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -259,15 +258,6 @@ def return_reward_range(dataset, max_episode_steps):
     return min(returns), max(returns)
 
 
-def modify_reward(dataset, env_name, max_episode_steps=1000):
-    if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
-        min_ret, max_ret = return_reward_range(dataset, max_episode_steps)
-        dataset["rewards"] /= max_ret - min_ret
-        dataset["rewards"] *= max_episode_steps
-    elif "antmaze" in env_name:
-        dataset["rewards"] -= 1.0
-
-
 def huber_loss(diff, sigma=1):
     beta = 1. / (sigma ** 2)
     diff = torch.abs(diff)
@@ -316,7 +306,6 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
-
 
 
 class VectorizedLinear(nn.Module):
@@ -470,7 +459,7 @@ class ImplicitQLearning:
         beta: float = 3.0,
         max_steps: int = 1000000,
         discount: float = 0.99,
-        tau: float = 0.005,
+        soft_target_update_rate: float = 0.005,
         device: str = "cpu",
     ):
         self.max_action = max_action
@@ -485,7 +474,7 @@ class ImplicitQLearning:
         self.iql_tau = iql_tau
         self.beta = beta
         self.discount = discount
-        self.tau = tau
+        self.soft_target_update_rate = soft_target_update_rate
 
         self.total_it = 0
         self.device = device
@@ -541,7 +530,7 @@ class ImplicitQLearning:
         q_loss.backward()
         self.q_optimizer.step()
         # Update target Q network
-        soft_update(self.q_target, self.qf, self.tau)
+        soft_update(self.q_target, self.qf, self.soft_target_update_rate)
 
     def _update_policy(self, adv, observations, actions, log_dict, attack_indexes):
         batch_size, obs_dim = observations.shape[0], observations.shape[-1]
@@ -554,9 +543,8 @@ class ImplicitQLearning:
             raise NotImplementedError
 
         exp_adv = torch.exp(self.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-        policy_loss = exp_adv * bc_losses  
+        policy_loss = torch.mean(exp_adv * bc_losses)  
 
-        policy_loss = torch.mean(policy_loss)
         log_dict["actor_loss"] = policy_loss.item()
         log_dict['bc_loss'] = bc_losses.mean().item()
         log_dict['exp_weights'] = exp_adv.mean().item()
@@ -587,7 +575,6 @@ class ImplicitQLearning:
         self._update_q(next_v, observations, actions, rewards, dones, log_dict, attack_indexes)
         # Update actor
         self._update_policy(adv, observations, actions, log_dict, attack_indexes)
-
         return log_dict
 
     def state_dict(self) -> Dict[str, Any]:
@@ -671,11 +658,15 @@ def train(config: TrainConfig):
     print('num_critics: {}'.format(config.num_critics))
     q_network = VectorizedQ(state_dim, action_dim, num_critics=config.num_critics).to(config.device)
     v_network = ValueFunction(state_dim).to(config.device)
-    actor = DeterministicPolicy(state_dim, action_dim, max_action).to(config.device)
+    actor = (
+        DeterministicPolicy(state_dim, action_dim, max_action)
+        if config.iql_deterministic
+        else GaussianPolicy(state_dim, action_dim, max_action)
+    ).to(config.device)
 
-    v_optimizer = torch.optim.Adam(v_network.parameters(), lr=3e-4)
-    q_optimizer = torch.optim.Adam(q_network.parameters(), lr=3e-4)
-    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=3e-4)
+    v_optimizer = torch.optim.Adam(v_network.parameters(), lr=config.learning_rate)
+    q_optimizer = torch.optim.Adam(q_network.parameters(), lr=config.learning_rate)
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.learning_rate)
 
     kwargs = {
         "max_action": max_action,
@@ -686,7 +677,7 @@ def train(config: TrainConfig):
         "v_network": v_network,
         "v_optimizer": v_optimizer,
         "discount": config.discount,
-        "tau": config.tau,
+        "soft_target_update_rate": config.soft_target_update_rate,
         "device": config.device,
         # IQL
         "beta": config.beta,
@@ -738,6 +729,12 @@ def train(config: TrainConfig):
             eval_log["eval/normalized_score_std"] = np.std(normalized_score)
 
             wandb.log(eval_log)
+        
+        if (epoch+1) % 1000 == 0 and config.checkpoints_path is not None:
+                torch.save(
+                    trainer.state_dict(),
+                    os.path.join(config.checkpoints_path, f"{epoch}.pt"),
+                )
 
     wandb.finish()
 
@@ -747,7 +744,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', type=str, default='halfcheetah-medium-v2')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--iql_deterministic', action='store_true', default=False)
     parser.add_argument('--corrupt_reward', action='store_true', default=False)
     parser.add_argument('--corrupt_dynamics', action='store_true', default=False)
     parser.add_argument('--corrupt_acts', action='store_true', default=False)
@@ -755,13 +751,13 @@ if __name__ == "__main__":
     parser.add_argument('--corruption_mode', type=str, default='random')
     parser.add_argument('--corruption_range', type=float, default=0.3)
     parser.add_argument('--corruption_rate', type=float, default=0.1)
+    parser.add_argument('--checkpoints_path', type=str, default=None)
     args = parser.parse_args()
     print(args)
 
     ### modify config
     TrainConfig.env_name = args.env_name
     TrainConfig.train_seed = args.seed
-    TrainConfig.iql_deterministic = args.iql_deterministic
     TrainConfig.corrupt_reward = args.corrupt_reward
     TrainConfig.corrupt_dynamics = args.corrupt_dynamics
     TrainConfig.corrupt_acts = args.corrupt_acts
@@ -769,6 +765,7 @@ if __name__ == "__main__":
     TrainConfig.corruption_mode = args.corruption_mode
     TrainConfig.corruption_range = args.corruption_range
     TrainConfig.corruption_rate = args.corruption_rate
+    TrainConfig.checkpoints_path = args.checkpoints_path
 
     ## modify config
     if TrainConfig.corrupt_reward:
@@ -777,12 +774,12 @@ if __name__ == "__main__":
         group_name_center = 'dynamics'
     elif TrainConfig.corrupt_acts:
         group_name_center = 'actions'
-    else:
+    elif TrainConfig.corrupt_obs:
         group_name_center = 'observations'
+    else:
+        group_name_center = 'no_attack'
 
-    # # medium-replay scale=2
     get_config(TrainConfig)
-
     TrainConfig.flag = 'RIQL_ensembleQ{}_huber{}_normobs{}_quantile{}'.format(
                         TrainConfig.num_critics, TrainConfig.sigma, TrainConfig.normalize, TrainConfig.quantile)
     print('flag: {}'.format(TrainConfig.flag))

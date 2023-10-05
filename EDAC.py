@@ -3,7 +3,7 @@
 # 2. implementation: https://github.com/snu-mllab/EDAC
 from typing import Any, Dict, List, Optional, Tuple, Union
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import math
 import os
 import random
@@ -18,6 +18,7 @@ from torch.distributions import Normal
 import torch.nn as nn
 from tqdm import trange
 import wandb
+from attack import attack_dataset
 
 def asdict(config):
     dic = {}
@@ -27,87 +28,62 @@ def asdict(config):
             dic[key] = value
     return dic
 
-
-@dataclass
-class TrainConfig:
-    # wandb params
-    project: str = "Corrupt_rate_ablation"
-    group: str = "EDAC"
-    name: str = "EDAC"
-    # model params
-    hidden_dim: int = 256
-    num_critics: int = 10
-    gamma: float = 0.99
-    tau: float = 5e-3
-    eta: float = 1.0
-    actor_learning_rate: float = 3e-4
-    critic_learning_rate: float = 3e-4
-    alpha_learning_rate: float = 3e-4
-    max_action: float = 1.0
-    # training params
-    buffer_size: int = 1_000_000
-    env_name: str = "halfcheetah-medium-v2"
-    # env_name: str = 'walker2d-medium-replay-v2' 
-    batch_size: int = 256
-    num_epochs: int = 3000
-    num_updates_on_epoch: int = 1000
-    normalize_reward: bool = False
-    # evaluation params
-    eval_episodes: int = 10
-    eval_every: int = 50
-    # general params
-    checkpoints_path: Optional[str] = None
-    deterministic_torch: bool = False
-    train_seed: int = 4
-    eval_seed: int = 42
-    log_every: int = 100
-    device: str = "cuda"
-
-    ###### corruption
-    corruption_reward: bool = False
-    corruption_dynamics: bool = False
-    corruption_obs: bool = False
-    corruption_acts: bool = False
-    random_corruption: bool = False
-    corruption_range: float = 0.5
-    corruption_rate: float = 0.1  
-
-
-
 # general utils
 TensorBatch = List[torch.Tensor]
 
+@dataclass
+class TrainConfig:
+    # Experiment
+    num_epochs: int = 3000
+    num_updates_on_epoch: int = 1000
+    eval_episodes: int = 10
+    eval_every: int = 10
+    log_every: int = 100
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
+    checkpoints_path: Optional[str] = None
+    buffer_size: int = 2_000_000 
+    batch_size: int = 256
+    discount: float = 0.99
+    soft_target_update_rate: float = 0.005
+    actor_learning_rate: float = 3e-4
+    critic_learning_rate: float = 3e-4
+    alpha_learning_rate: float = 3e-4
+    hidden_dim: int = 256
+    num_critics: int = 10
+    eta: float = 1.0
+    normalize: bool = False # Normalize states
+
+    ## Wandb 
+    project: str = "Robust_Offline_RL"
+    group: str = "EDAC"
+    name: str = "EDAC"
+    env_name: str = "halfcheetah-medium-v2"
+    train_seed: int = 0
+    eval_seed: int = 42
+
+    ###### corruption
+    corrupt_reward: bool = False
+    corrupt_dynamics: bool = False
+    corrupt_obs: bool = False
+    corrupt_acts: bool = False
+    corruption_mode: str = 'random'
+    corruption_range: float = 1.0
+    corruption_rate: float = 0.3  
+
+
+def soft_update(target: nn.Module, source: nn.Module, soft_target_update_rate: float):
     for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
+        target_param.data.copy_((1 - soft_target_update_rate) * target_param.data + soft_target_update_rate * source_param.data)
+
+def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
+    mean = states.mean(0)
+    std = states.std(0) + eps
+    return mean, std
 
 
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-    )
-    # wandb.run.save()
-
-
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    try:
-        torch.use_deterministic_algorithms(deterministic_torch)
-    except:
-        torch.set_deterministic(deterministic_torch)
-
+def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
+    return (states - mean) / std
 
 
 def wrap_env(
@@ -116,16 +92,21 @@ def wrap_env(
     state_std: Union[np.ndarray, float] = 1.0,
     reward_scale: float = 1.0,
 ) -> gym.Env:
+    # PEP 8: E731 do not assign a lambda expression, use a def
     def normalize_state(state):
-        return (state - state_mean) / state_std
+        return (
+            state - state_mean
+        ) / state_std  # epsilon should be already added in std.
 
     def scale_reward(reward):
+        # Please be careful, here reward is multiplied by scale!
         return reward_scale * reward
 
     env = gym.wrappers.TransformObservation(env, normalize_state)
     if reward_scale != 1.0:
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
+
 
 
 class ReplayBuffer:
@@ -187,6 +168,34 @@ class ReplayBuffer:
     def add_transition(self):
         # Use this method to add new data into the replay buffer during fine-tuning.
         raise NotImplementedError
+
+
+def set_seed(
+    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
+):
+    if env is not None:
+        env.seed(seed)
+        env.action_space.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        torch.use_deterministic_algorithms(deterministic_torch)
+    except:
+        torch.set_deterministic(deterministic_torch)
+
+
+def wandb_init(config: dict) -> None:
+    wandb.init(
+        config=config,
+        project=config["project"],
+        group=config["group"],
+        name=config["name"],
+        id=str(uuid.uuid4()),
+    )
+
+
 
 
 # SAC Actor & Critic implementation
@@ -320,6 +329,42 @@ class VectorizedCritic(nn.Module):
         return q_values
 
 
+
+@torch.no_grad()
+def eval_actor(
+    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
+) -> np.ndarray:
+    env.seed(seed)
+    actor.eval()
+    episode_rewards = []
+    for _ in range(n_episodes):
+        state, done = env.reset(), False
+        episode_reward = 0.0
+        while not done:
+            action = actor.act(state, device)
+            state, reward, done, _ = env.step(action)
+            episode_reward += reward
+        episode_rewards.append(episode_reward)
+
+    actor.train()
+    return np.array(episode_rewards)
+
+
+def return_reward_range(dataset, max_episode_steps):
+    returns, lengths = [], []
+    ep_ret, ep_len = 0.0, 0
+    for r, d in zip(dataset["rewards"], dataset["terminals"]):
+        ep_ret += float(r)
+        ep_len += 1
+        if d or ep_len == max_episode_steps:
+            returns.append(ep_ret)
+            lengths.append(ep_len)
+            ep_ret, ep_len = 0.0, 0
+    lengths.append(ep_len)  # but still keep track of number of steps
+    assert sum(lengths) == len(dataset["rewards"])
+    return min(returns), max(returns)
+
+
 class EDAC:
     def __init__(
         self,
@@ -327,8 +372,8 @@ class EDAC:
         actor_optimizer: torch.optim.Optimizer,
         critic: VectorizedCritic,
         critic_optimizer: torch.optim.Optimizer,
-        gamma: float = 0.99,
-        tau: float = 0.005,
+        discount: float = 0.99,
+        soft_target_update_rate: float = 0.005,
         eta: float = 1.0,
         alpha_learning_rate: float = 1e-4,
         device: str = "cpu",  # noqa
@@ -343,8 +388,8 @@ class EDAC:
         self.actor_optimizer = actor_optimizer
         self.critic_optimizer = critic_optimizer
 
-        self.tau = tau
-        self.gamma = gamma
+        self.soft_target_update_rate = soft_target_update_rate
+        self.discount = discount
         self.eta = eta
 
         # adaptive alpha setup
@@ -434,7 +479,7 @@ class EDAC:
             q_next = q_next - self.alpha * next_action_log_prob
 
             assert q_next.unsqueeze(-1).shape == done.shape == reward.shape
-            q_target = reward + self.gamma * (1 - done) * q_next.unsqueeze(-1)
+            q_target = reward + self.discount * (1 - done) * q_next.unsqueeze(-1)
 
         q_values = self.critic(state, action)
         # [ensemble_size, batch_size] - [1, batch_size]
@@ -472,7 +517,7 @@ class EDAC:
 
         #  Target networks soft update
         with torch.no_grad():
-            soft_update(self.target_critic, self.critic, tau=self.tau)
+            soft_update(self.target_critic, self.critic, soft_target_update_rate=self.soft_target_update_rate)
             # for logging, Q-ensemble std estimate with the random actions:
             # a ~ U[-max_action, max_action]
             max_action = self.actor.max_action
@@ -514,157 +559,86 @@ class EDAC:
         self.alpha = self.log_alpha.exp().detach()
 
 
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.array(episode_rewards)
-
-
-def return_reward_range(dataset, max_episode_steps):
-    returns, lengths = [], []
-    ep_ret, ep_len = 0.0, 0
-    for r, d in zip(dataset["rewards"], dataset["terminals"]):
-        ep_ret += float(r)
-        ep_len += 1
-        if d or ep_len == max_episode_steps:
-            returns.append(ep_ret)
-            lengths.append(ep_len)
-            ep_ret, ep_len = 0.0, 0
-    lengths.append(ep_len)  # but still keep track of number of steps
-    assert sum(lengths) == len(dataset["rewards"])
-    return min(returns), max(returns)
-
-
-def modify_reward(dataset, env_name, max_episode_steps=1000):
-    if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
-        min_ret, max_ret = return_reward_range(dataset, max_episode_steps)
-        dataset["rewards"] /= max_ret - min_ret
-        dataset["rewards"] *= max_episode_steps
-    elif "antmaze" in env_name:
-        dataset["rewards"] -= 1.0
-
 
 # @pyrallis.wrap()
 def train(config: TrainConfig):
-    set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
+    env = gym.make(config.env_name)
+    seed = config.train_seed
+    set_seed(seed, env)
     wandb_init(asdict(config))
 
-    # data, evaluation, env setup
-    eval_env = wrap_env(gym.make(config.env_name))
-    state_dim = eval_env.observation_space.shape[0]
-    action_dim = eval_env.action_space.shape[0]
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
 
-    dataset = d4rl.qlearning_dataset(eval_env)
+    dataset = d4rl.qlearning_dataset(env)
 
     ##### corrupt
-    if (config.corruption_reward or config.corruption_dynamics or config.corruption_obs or config.corruption_acts):
-        if config.random_corruption:
-            print('random corruption')
-            random_num = np.random.random(dataset["rewards"].shape)
-            indexs = np.where(random_num < config.corruption_rate)
+    if (config.corrupt_reward or config.corrupt_dynamics or config.corrupt_obs or config.corrupt_acts):
+        dataset, indexes = attack_dataset(config, dataset)
 
-            ##### attack indexes
-            # attack_indexes[indexs] = 1.0
+    if config.normalize:
+        state_mean, state_std = compute_mean_std(np.concatenate([dataset["observations"], dataset['next_observations']], axis=0), eps=1e-3)
+    else:
+        state_mean, state_std = 0, 1
 
-            if config.corruption_dynamics: # corrupt dynamics
-                print('attack dynamics')
-                std = dataset["next_observations"].std(axis=0).reshape(1,state_dim)
-                dataset["next_observations"][indexs] += \
-                            np.random.uniform(-config.corruption_range, config.corruption_range, size=(indexs[0].shape[0], state_dim)) * std
-            
-            if config.corruption_reward: # corrupt rewards
-                print('attack reward')
-                dataset["rewards"][indexs] = \
-                            np.random.uniform(-config.corruption_range, config.corruption_range, size=indexs[0].shape[0])
-            
-            if config.corruption_obs:
-                print('attack observation')
-                std = dataset["observations"].std(axis=0).reshape(1,state_dim)
-                dataset["observations"][indexs] += np.random.uniform(-config.corruption_range, config.corruption_range, size=(indexs[0].shape[0], state_dim)) * std
-            
-            if config.corruption_acts:
-                print('attack actions')
-                std = dataset['actions'].std(axis=0).reshape(1, action_dim)
-                dataset["actions"][indexs] += np.random.uniform(-config.corruption_range, config.corruption_range, size=(indexs[0].shape[0], action_dim)) * std
+    print('state mean: ', state_mean)
+    print('state std: ', state_std)
 
-        else:
-            print('adversarial corruption')
-            import pdb;pdb.set_trace()
-            # if config.corruption_reward:
-            #     print('attack reward')
-            #     random_num = np.random.random(dataset["rewards"].shape)
-            #     indexs = np.where(random_num < config.corruption_rate)
-            #     # corrupt rewards
-            #     dataset["rewards"][indexs] *= - config.corruption_range
-            
-            # if config.corruption_dynamics:
-            #     print('attack dynamics')
-            #     env_dir = 'walker2d_new_diverse' if config.env_name.startswith('walker2d') else 'halfcheetah'
-            #     print('loading path {}'.format(os.path.join('./log_attack_data/{}/'.format(env_dir), "attack_data_corrupt{}_rate{}.pt".format(config.corruption_range, config.corruption_rate))))
-            #     data_dict = torch.load(os.path.join('./log_attack_data/{}/'.format(env_dir), "attack_data_corrupt{}_rate{}.pt".format(config.corruption_range, config.corruption_rate)))
-            #     attack_indexs, next_observations  = data_dict['index'], data_dict['next_observations']
-            #     dataset["next_observations"][attack_indexs] = next_observations
-
-    if config.normalize_reward:
-        modify_reward(dataset, config.env_name)
-
-    buffer = ReplayBuffer(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        buffer_size=config.buffer_size,
-        device=config.device,
+    dataset["observations"] = normalize_states(
+        dataset["observations"], state_mean, state_std
     )
-    buffer.load_d4rl_dataset(dataset)
+    dataset["next_observations"] = normalize_states(
+        dataset["next_observations"], state_mean, state_std
+    )
+    env = wrap_env(env, state_mean=state_mean, state_std=state_std)
 
-    # Actor & Critic setup
-    actor = Actor(state_dim, action_dim, config.hidden_dim, config.max_action)
-    actor.to(config.device)
-    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_learning_rate)
-    critic = VectorizedCritic(
-        state_dim, action_dim, config.hidden_dim, config.num_critics
+    replay_buffer = ReplayBuffer(
+        state_dim,
+        action_dim,
+        config.buffer_size,
+        config.device,
     )
-    critic.to(config.device)
-    critic_optimizer = torch.optim.Adam(
-        critic.parameters(), lr=config.critic_learning_rate
-    )
+    replay_buffer.load_d4rl_dataset(dataset)
+    max_action = float(env.action_space.high[0])
 
-    trainer = EDAC(
-        actor=actor,
-        actor_optimizer=actor_optimizer,
-        critic=critic,
-        critic_optimizer=critic_optimizer,
-        gamma=config.gamma,
-        tau=config.tau,
-        eta=config.eta,
-        alpha_learning_rate=config.alpha_learning_rate,
-        device=config.device,
-    )
-    # saving config to the checkpoint
     if config.checkpoints_path is not None:
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
             pyrallis.dump(config, f)
 
+    # Actor & Critic setup
+    actor = Actor(state_dim, action_dim, config.hidden_dim, max_action).to(config.device)
+    critic = VectorizedCritic(
+        state_dim, action_dim, config.hidden_dim, config.num_critics
+    ).to(config.device)
+    
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_learning_rate)
+    critic_optimizer = torch.optim.Adam(
+        critic.parameters(), lr=config.critic_learning_rate
+    )
+
+    print("---------------------------------------")
+    print(f"Training EDAC, Env: {config.env_name}, Seed: {seed}")
+    print("---------------------------------------")
+
+
+    trainer = EDAC(
+        actor=actor,
+        actor_optimizer=actor_optimizer,
+        critic=critic,
+        critic_optimizer=critic_optimizer,
+        discount=config.discount,
+        soft_target_update_rate=config.soft_target_update_rate,
+        eta=config.eta,
+        alpha_learning_rate=config.alpha_learning_rate,
+        device=config.device,
+    )
+
     total_updates = 0.0
     for epoch in trange(config.num_epochs, desc="Training"):
-        # training
         for _ in trange(config.num_updates_on_epoch, desc="Epoch", leave=False):
-            batch = buffer.sample(config.batch_size)
+            batch = replay_buffer.sample(config.batch_size)
             update_info = trainer.update(batch)
 
             if total_updates % config.log_every == 0:
@@ -675,7 +649,7 @@ def train(config: TrainConfig):
         # evaluation
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
             eval_returns = eval_actor(
-                env=eval_env,
+                env=env,
                 actor=actor,
                 n_episodes=config.eval_episodes,
                 seed=config.eval_seed,
@@ -686,18 +660,18 @@ def train(config: TrainConfig):
                 "eval/reward_std": np.std(eval_returns),
                 "epoch": epoch,
             }
-            if hasattr(eval_env, "get_normalized_score"):
-                normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
+            if hasattr(env, "get_normalized_score"):
+                normalized_score = env.get_normalized_score(eval_returns) * 100.0
                 eval_log["eval/normalized_score_mean"] = np.mean(normalized_score)
                 eval_log["eval/normalized_score_std"] = np.std(normalized_score)
 
             wandb.log(eval_log)
 
-        # if (epoch+1) % 1000 == 0 and config.checkpoints_path is not None:
-        #     torch.save(
-        #         trainer.state_dict(),
-        #         os.path.join(config.checkpoints_path, f"{epoch}.pt"),
-        #     )
+        if (epoch+1) % 1000 == 0 and config.checkpoints_path is not None:
+            torch.save(
+                trainer.state_dict(),
+                os.path.join(config.checkpoints_path, f"{epoch}.pt"),
+            )
 
     wandb.finish()
 
@@ -707,43 +681,47 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', type=str, default='halfcheetah-medium-v2')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--corruption_reward', action='store_true', default=False)
-    parser.add_argument('--corruption_dynamics', action='store_true', default=False)
-    parser.add_argument('--corruption_acts', action='store_true', default=False)
-    parser.add_argument('--corruption_obs', action='store_true', default=False)
-    parser.add_argument('--random_corruption', action='store_true', default=False)
-    parser.add_argument('--corruption_range', type=float, default=0.3)
-    parser.add_argument('--corruption_rate', type=float, default=0.1)
+    parser.add_argument('--corrupt_reward', action='store_true', default=False)
+    parser.add_argument('--corrupt_dynamics', action='store_true', default=False)
+    parser.add_argument('--corrupt_acts', action='store_true', default=False)
+    parser.add_argument('--corrupt_obs', action='store_true', default=False)
+    parser.add_argument('--corruption_mode', type=str, default='random')
+    parser.add_argument('--corruption_range', type=float, default=1.0)
+    parser.add_argument('--corruption_rate', type=float, default=0.3)
+    parser.add_argument('--checkpoints_path', type=str, default=None)
     args = parser.parse_args()
     print(args)
 
     ### modify config
     TrainConfig.env_name = args.env_name
     TrainConfig.train_seed = args.seed
-    TrainConfig.corruption_reward = args.corruption_reward
-    TrainConfig.corruption_dynamics = args.corruption_dynamics
-    TrainConfig.corruption_acts = args.corruption_acts
-    TrainConfig.corruption_obs = args.corruption_obs
-    TrainConfig.random_corruption = args.random_corruption
+    TrainConfig.corrupt_reward = args.corrupt_reward
+    TrainConfig.corrupt_dynamics = args.corrupt_dynamics
+    TrainConfig.corrupt_acts = args.corrupt_acts
+    TrainConfig.corrupt_obs = args.corrupt_obs
+    TrainConfig.corruption_mode = args.corruption_mode
     TrainConfig.corruption_range = args.corruption_range
     TrainConfig.corruption_rate = args.corruption_rate
+    TrainConfig.checkpoints_path = args.checkpoints_path
 
-    if TrainConfig.corruption_reward:
-        group_name_center = 'reward' 
-    elif TrainConfig.corruption_dynamics:
-        group_name_center = 'dynamics'
-    elif TrainConfig.corruption_acts:
-        group_name_center = 'actions'
-    else:
-        group_name_center = 'observations'
 
     ## modify config
-    group_name_center = 'random_' + group_name_center if TrainConfig.random_corruption else 'adversarial_' + group_name_center
-    TrainConfig.group = TrainConfig.group + '-{}'.format(group_name_center) 
-    TrainConfig.group = TrainConfig.group + '_{}'.format(TrainConfig.env_name.split('-')[0])
-    TrainConfig.name = "EDAC_baseline_corrupt{}_{}_seed{}".format(TrainConfig.corruption_range, TrainConfig.corruption_rate, TrainConfig.train_seed)
+    if TrainConfig.corrupt_reward:
+        group_name_center = 'reward' 
+    elif TrainConfig.corrupt_dynamics:
+        group_name_center = 'dynamics'
+    elif TrainConfig.corrupt_acts:
+        group_name_center = 'actions'
+    elif TrainConfig.corrupt_obs:
+        group_name_center = 'observations'
+    else:
+        group_name_center = 'no_attack'
+
+    group_name_center = '{}_'.format(TrainConfig.corruption_mode) + group_name_center 
+    TrainConfig.group = TrainConfig.group + '-{}'.format(group_name_center) + '_{}'.format(TrainConfig.env_name.split('-')[0])
+    TrainConfig.name = "EDAC_corrupt{}_{}_baseline_seed{}".format(TrainConfig.corruption_range, TrainConfig.corruption_rate, TrainConfig.train_seed)
     TrainConfig.name = f"{TrainConfig.name}-{TrainConfig.env_name}-{str(uuid.uuid4())[:8]}"
     if TrainConfig.checkpoints_path is not None:
-        TrainConfig.checkpoints_path = os.path.join(TrainConfig.checkpoints_path, TrainConfig.name)
+        TrainConfig.checkpoints_path = os.path.join(TrainConfig.checkpoints_path, TrainConfig.group, TrainConfig.name)
     
     train(TrainConfig)

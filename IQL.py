@@ -1,5 +1,3 @@
-# source: https://github.com/gwthomas/IQL-PyTorch
-# https://arxiv.org/pdf/2110.06169.pdf
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import copy
 from dataclasses import dataclass
@@ -41,15 +39,13 @@ def asdict(config):
 @dataclass
 class TrainConfig:
     # Experiment
+    num_epochs: int = 3000     
+    num_updates_on_epoch: int = 1000
     eval_episodes: int = 10 
     eval_every: int = 10  
     log_every: int = 100
-    n_episodes: int = 10 
-    device: str = "cuda"
-    num_epochs: int = 3000     
-    num_updates_on_epoch: int = 1000
-    eval_freq: int = int(1e4)  # How often (time steps) we evaluate
-    n_episodes: int = 10  # How many episodes run during evaluation
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    
     max_timesteps: int = int(3e6)  # Max time steps to run environment
     checkpoints_path: Optional[str] = None  # Save path
     load_model: str = ""  # Model load file name, "" doesn't load
@@ -57,7 +53,8 @@ class TrainConfig:
     buffer_size: int = 2_000_000  # Replay buffer size
     batch_size: int = 256  # Batch size for all networks
     discount: float = 0.99  # Discount factor
-    tau: float = 0.005  # Target network update rate
+    soft_target_update_rate: float = 0.005  # Target network update rate
+    learning_rate: float = 3e-4
     beta: float = 3.0  # Inverse temperature. Small beta -> BC, big beta -> maximizing Q
     iql_tau: float = 0.7  # Coefficient for asymmetric loss
     iql_deterministic: bool = True  # Use deterministic actor
@@ -77,13 +74,13 @@ class TrainConfig:
     corrupt_obs: bool = False
     corrupt_acts: bool = False
     corruption_mode: str = 'random'
-    corruption_range: float = 0.5
-    corruption_rate: float = 0.1  
+    corruption_range: float = 1.0
+    corruption_rate: float = 0.3  
 
 
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
+def soft_update(target: nn.Module, source: nn.Module, soft_target_update_rate: float):
     for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
+        target_param.data.copy_((1 - soft_target_update_rate) * target_param.data + soft_target_update_rate * source_param.data)
 
 
 def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -237,26 +234,15 @@ def return_reward_range(dataset, max_episode_steps):
             returns.append(ep_ret)
             lengths.append(ep_len)
             ep_ret, ep_len = 0.0, 0
-    lengths.append(ep_len)  # but still keep track of number of steps
+    lengths.append(ep_len)  
     assert sum(lengths) == len(dataset["rewards"])
     return min(returns), max(returns)
 
 
-def modify_reward(dataset, env_name, max_episode_steps=1000):
-    if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
-        min_ret, max_ret = return_reward_range(dataset, max_episode_steps)
-        dataset["rewards"] /= max_ret - min_ret
-        dataset["rewards"] *= max_episode_steps
-    elif "antmaze" in env_name:
-        dataset["rewards"] -= 1.0
 
+def asymmetric_l2_loss(u: torch.Tensor, tau: float) -> torch.Tensor:
+    return torch.mean(torch.abs(tau - (u < 0).float()) * u**2)
 
-
-def asymmetric_l2_loss(u: torch.Tensor, tau: float, keep_dim=False) -> torch.Tensor:
-    if keep_dim:
-        return torch.abs(tau - (u < 0).float()) * u**2
-    else:
-        return torch.mean(torch.abs(tau - (u < 0).float()) * u**2)
 
 class Squeeze(nn.Module):
     def __init__(self, dim=-1):
@@ -376,6 +362,7 @@ class TwinQ(nn.Module):
 
 
 class QFunction(nn.Module):
+    ### Used for IQL with single Q function
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, n_hidden: int = 2):
         super().__init__()
         dims = [state_dim+action_dim, *([hidden_dim] * n_hidden), 1]
@@ -410,7 +397,7 @@ class ImplicitQLearning:
         beta: float = 3.0,
         max_steps: int = 1000000,
         discount: float = 0.99,
-        tau: float = 0.005,
+        soft_target_update_rate: float = 0.005,
         device: str = "cpu",
     ):
         self.max_action = max_action
@@ -425,7 +412,7 @@ class ImplicitQLearning:
         self.iql_tau = iql_tau
         self.beta = beta
         self.discount = discount
-        self.tau = tau
+        self.soft_target_update_rate = soft_target_update_rate
 
         self.total_it = 0
         self.device = device
@@ -468,7 +455,7 @@ class ImplicitQLearning:
         self.q_optimizer.step()
 
         # Update target Q network
-        soft_update(self.q_target, self.qf, self.tau)
+        soft_update(self.q_target, self.qf, self.soft_target_update_rate)
 
     def _update_policy(self, adv, observations, actions, log_dict):
         exp_adv = torch.exp(self.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
@@ -560,6 +547,7 @@ def train(config: TrainConfig):
         state_mean, state_std = compute_mean_std(np.concatenate([dataset["observations"], dataset['next_observations']], axis=0), eps=1e-3)
     else:
         state_mean, state_std = 0, 1
+
     print('state mean: ', state_mean)
     print('state std: ', state_std)
 
@@ -578,7 +566,6 @@ def train(config: TrainConfig):
         config.device,
     )
     replay_buffer.load_d4rl_dataset(dataset)
-
     max_action = float(env.action_space.high[0])
 
     if config.checkpoints_path is not None:
@@ -596,9 +583,9 @@ def train(config: TrainConfig):
         if config.iql_deterministic
         else GaussianPolicy(state_dim, action_dim, max_action)
     ).to(config.device)
-    v_optimizer = torch.optim.Adam(v_network.parameters(), lr=3e-4)
-    q_optimizer = torch.optim.Adam(q_network.parameters(), lr=3e-4)
-    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=3e-4)
+    v_optimizer = torch.optim.Adam(v_network.parameters(), lr=config.learning_rate)
+    q_optimizer = torch.optim.Adam(q_network.parameters(), lr=config.learning_rate)
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.learning_rate)
 
     kwargs = {
         "max_action": max_action,
@@ -609,7 +596,7 @@ def train(config: TrainConfig):
         "v_network": v_network,
         "v_optimizer": v_optimizer,
         "discount": config.discount,
-        "tau": config.tau,
+        "soft_target_update_rate": config.soft_target_update_rate,
         "device": config.device,
         # IQL
         "beta": config.beta,
@@ -630,7 +617,6 @@ def train(config: TrainConfig):
         actor = trainer.actor
 
 
-    # evaluations = []
     total_updates = 0.0
     for epoch in trange(config.num_epochs, desc="Training"):
         for _ in trange(config.num_updates_on_epoch, desc="Epoch", leave=False):
@@ -645,20 +631,19 @@ def train(config: TrainConfig):
 
         # Evaluate episode
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
-            eval_scores = eval_actor(
+            eval_returns = eval_actor(
                 env,
                 actor,
                 device=config.device,
                 n_episodes=config.eval_episodes,
                 seed=config.eval_seed,
             )
-            eval_returns = eval_scores
             eval_log = {
                 "eval/reward_mean": np.mean(eval_returns),
                 "eval/reward_std": np.std(eval_returns),
                 "epoch": epoch,
             }
-            normalized_score = env.get_normalized_score(eval_scores) * 100.0
+            normalized_score = env.get_normalized_score(eval_returns) * 100.0
             eval_log["eval/normalized_score_mean"] = np.mean(normalized_score)
             eval_log["eval/normalized_score_std"] = np.std(normalized_score)
 
@@ -683,8 +668,8 @@ if __name__ == "__main__":
     parser.add_argument('--corrupt_acts', action='store_true', default=False)
     parser.add_argument('--corrupt_obs', action='store_true', default=False)
     parser.add_argument('--corruption_mode', type=str, default='random')
-    parser.add_argument('--corruption_range', type=float, default=0.0)
-    parser.add_argument('--corruption_rate', type=float, default=0.0)
+    parser.add_argument('--corruption_range', type=float, default=1.0)
+    parser.add_argument('--corruption_rate', type=float, default=0.3)
     parser.add_argument('--checkpoints_path', type=str, default=None)
     args = parser.parse_args()
     print(args)
@@ -696,7 +681,7 @@ if __name__ == "__main__":
     TrainConfig.corrupt_dynamics = args.corrupt_dynamics
     TrainConfig.corrupt_acts = args.corrupt_acts
     TrainConfig.corrupt_obs = args.corrupt_obs
-    TrainConfig.random_corruption = args.random_corruption
+    TrainConfig.corruption_mode = args.corruption_mode
     TrainConfig.corruption_range = args.corruption_range
     TrainConfig.corruption_rate = args.corruption_rate
     TrainConfig.checkpoints_path = args.checkpoints_path
@@ -715,8 +700,7 @@ if __name__ == "__main__":
 
     group_name_center = '{}_'.format(TrainConfig.corruption_mode) + group_name_center 
     TrainConfig.group = TrainConfig.group + '-{}'.format(group_name_center) + '_{}'.format(TrainConfig.env_name.split('-')[0])
-    TrainConfig.name = "IQL_corrupt{}_{}_single_baseline_seed{}".format(TrainConfig.corruption_range, TrainConfig.corruption_rate, TrainConfig.train_seed)
-    # TrainConfig.name = "IQL_corrupt{}_{}_baseline_norm2_seed{}".format(TrainConfig.corruption_range, TrainConfig.corruption_rate, TrainConfig.train_seed)
+    TrainConfig.name = "IQL_corrupt{}_{}_baseline_seed{}".format(TrainConfig.corruption_range, TrainConfig.corruption_rate, TrainConfig.train_seed)
     TrainConfig.name = f"{TrainConfig.name}-{TrainConfig.env_name}-{str(uuid.uuid4())[:8]}"
     if TrainConfig.checkpoints_path is not None:
         TrainConfig.checkpoints_path = os.path.join(TrainConfig.checkpoints_path, TrainConfig.group, TrainConfig.name)

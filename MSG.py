@@ -1,13 +1,6 @@
-# Inspired by:
-# 1. paper for SAC-N: https://arxiv.org/abs/2110.01548
-# 2. implementation: https://github.com/snu-mllab/EDAC
-
-# The only difference from the original implementation:
-# default pytorch weight initialization,
-# without custom rlkit init & uniform init for last layers.
 from typing import Any, Dict, List, Optional, Tuple, Union
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import math
 import os
 import random
@@ -22,6 +15,10 @@ from torch.distributions import Normal
 import torch.nn as nn
 from tqdm import trange
 import wandb
+from attack import attack_dataset
+
+TensorBatch = List[torch.Tensor]
+
 
 def asdict(config):
     dic = {}
@@ -33,82 +30,58 @@ def asdict(config):
 
 @dataclass
 class TrainConfig:
-    # wandb params
-    project: str = "Corrupt_rate_ablation"
-    group: str = 'MSG' 
-    name: str = "MSG"   
-    # model params
-    hidden_dim: int = 256
-    num_critics: int = 10
-    gamma: float = 0.99
-    tau: float = 5e-3
+    # Experiment
+    num_epochs: int = 3000     
+    num_updates_on_epoch: int = 1000
+    eval_episodes: int = 10 
+    eval_every: int = 10  
+    log_every: int = 100
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    checkpoints_path: Optional[str] = None 
+    buffer_size: int = 2_000_000
+    batch_size: int = 256
+    discount: float = 0.99
+    soft_target_update_rate: float = 0.005  # Target network update rate
     actor_learning_rate: float = 3e-4
     critic_learning_rate: float = 3e-4
     alpha_learning_rate: float = 3e-4
-    max_action: float = 1.0
-    # training params
-    buffer_size: int = 1_000_000
-    env_name: str = "halfcheetah-medium-v2" 
-    # env_name: str = 'walker2d-medium-replay-v2' 
-    batch_size: int = 256
-    num_epochs: int = 3000     
-    num_updates_on_epoch: int = 1000
-    normalize_reward: bool = False
-    # evaluation params
-    eval_episodes: int = 10 
-    eval_every: int = 50
-    # general params
-    checkpoints_path: Optional[str] = None #'./log_checpoints'
-    deterministic_torch: bool = False
-    train_seed: int = 0          
-    eval_seed: int = 42
-    log_every: int = 100
-    device: str = "cuda"
-    LCB_ratio: float = 4.0      ############
-    target_LCB_ratio: float = 1.0 # no use
-    imitation_ratio: float = 0.0
-    ######## attack
-    corrupt_model_path: str = '/home/ryangam/CORL-main/algorithms/log_checpoints2/SAC-10_QLCB4_seed0-walker2d-medium-replay-v2-f082528d/2000.pt'
-    corruption_reward: bool = False
-    corruption_dynamics: bool = False
-    random_corruption: bool = False
-    corruption_range: float = 30   #0.3 for dynamics
-    corruption_rate: float = 0.3   # 0.3 halfcheetah, 0.2 walker2d
+    hidden_dim: int = 256
+    num_critics: int = 10
+    LCB_ratio: float = 4.0  
+    normalize: bool = False # Normalize states
+
+     # wandb params
+    project: str = "Robust_Offline_RL"
+    group: str = 'MSG' 
+    name: str = "MSG"  
+    env_name: str = 'walker2d-medium-replay-v2' 
+    train_seed: int = 0    
+    eval_seed: int = 42      
+    
+    ###### corruption
+    corrupt_reward: bool = False
+    corrupt_dynamics: bool = False
+    corrupt_obs: bool = False
+    corrupt_acts: bool = False
+    corruption_mode: str = 'random'
+    corruption_range: float = 1.0
+    corruption_rate: float = 0.3  
 
 
-# general utils
-TensorBatch = List[torch.Tensor]
-
-
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
+def soft_update(target: nn.Module, source: nn.Module, soft_target_update_rate: float):
     for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
+        target_param.data.copy_((1 - soft_target_update_rate) * target_param.data + soft_target_update_rate * source_param.data)
+
+def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
+    mean = states.mean(0)
+    std = states.std(0) + eps
+    return mean, std
 
 
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save() 
+def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
+    return (states - mean) / std
 
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    try:
-        torch.use_deterministic_algorithms(deterministic_torch)
-    except:
-        torch.set_deterministic(deterministic_torch)
 
 
 def wrap_env(
@@ -117,16 +90,21 @@ def wrap_env(
     state_std: Union[np.ndarray, float] = 1.0,
     reward_scale: float = 1.0,
 ) -> gym.Env:
+    # PEP 8: E731 do not assign a lambda expression, use a def
     def normalize_state(state):
-        return (state - state_mean) / state_std
+        return (
+            state - state_mean
+        ) / state_std  # epsilon should be already added in std.
 
     def scale_reward(reward):
+        # Please be careful, here reward is multiplied by scale!
         return reward_scale * reward
 
     env = gym.wrappers.TransformObservation(env, normalize_state)
     if reward_scale != 1.0:
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
+
 
 
 class ReplayBuffer:
@@ -187,6 +165,49 @@ class ReplayBuffer:
     def add_transition(self):
         # Use this method to add new data into the replay buffer during fine-tuning.
         raise NotImplementedError
+
+
+
+def set_seed(
+    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
+):
+    if env is not None:
+        env.seed(seed)
+        env.action_space.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        torch.use_deterministic_algorithms(deterministic_torch)
+    except:
+        torch.set_deterministic(deterministic_torch)
+
+
+def wandb_init(config: dict) -> None:
+    wandb.init(
+        config=config,
+        project=config["project"],
+        group=config["group"],
+        name=config["name"],
+        id=str(uuid.uuid4()),
+    )
+
+
+def return_reward_range(dataset, max_episode_steps):
+    returns, lengths = [], []
+    ep_ret, ep_len = 0.0, 0
+    for r, d in zip(dataset["rewards"], dataset["terminals"]):
+        ep_ret += float(r)
+        ep_len += 1
+        if d or ep_len == max_episode_steps:
+            returns.append(ep_ret)
+            lengths.append(ep_len)
+            ep_ret, ep_len = 0.0, 0
+    lengths.append(ep_len)  # but still keep track of number of steps
+    assert sum(lengths) == len(dataset["rewards"])
+    return min(returns), max(returns)
+
 
 
 # SAC Actor & Critic implementation
@@ -315,20 +336,36 @@ class VectorizedCritic(nn.Module):
         q_values = self.critic(state_action).squeeze(-1)
         return q_values
 
+@torch.no_grad()
+def eval_actor(
+    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
+) -> np.ndarray:
+    env.seed(seed)
+    actor.eval()
+    episode_rewards = []
+    for _ in range(n_episodes):
+        state, done = env.reset(), False
+        episode_reward = 0.0
+        while not done:
+            action = actor.act(state, device)
+            state, reward, done, _ = env.step(action)
+            episode_reward += reward
+        episode_rewards.append(episode_reward)
 
-class SACN:
+    actor.train()
+    return np.array(episode_rewards)
+
+class MSG:
     def __init__(
         self,
         actor: Actor,
         actor_optimizer: torch.optim.Optimizer,
         critic: VectorizedCritic,
         critic_optimizer: torch.optim.Optimizer,
-        gamma: float = 0.99,
-        tau: float = 0.005,
+        discount: float = 0.99,
+        soft_target_update_rate: float = 0.005,
         alpha_learning_rate: float = 1e-4,
         LCB_ratio: float = 4.0,
-        target_LCB_ratio: float = 1.0, 
-        imitation_ratio: float = 3.0,
         device: str = "cpu",  # noqa
     ):
         self.device = device
@@ -341,11 +378,9 @@ class SACN:
         self.actor_optimizer = actor_optimizer
         self.critic_optimizer = critic_optimizer
 
-        self.tau = tau
-        self.gamma = gamma
+        self.soft_target_update_rate = soft_target_update_rate
+        self.discount = discount
         self.LCB_ratio = LCB_ratio
-        self.target_LCB_ratio = target_LCB_ratio
-        self.imitation_ratio = imitation_ratio
 
         # adaptive alpha setup
         self.target_entropy = -float(self.actor.action_dim)
@@ -389,15 +424,12 @@ class SACN:
             # #### independent ######################################################################
             q_next = self.target_critic(next_state, next_action)
             q_next = q_next - self.alpha * next_action_log_prob.view(1,-1)
-            q_target = reward.view(1,-1) + self.gamma * (1 - done.view(1,-1)) * q_next.detach()
+            q_target = reward.view(1,-1) + self.discount * (1 - done.view(1,-1)) * q_next.detach()
 
         q_values = self.critic(state, action)
         # [ensemble_size, batch_size] - [1, batch_size]
         ######## independent ##################
         loss = ((q_values - q_target) ** 2).mean(dim=1).sum(dim=0)
-        # ####### huber loss
-        # huber_loss = torch.nn.SmoothL1Loss(reduce=False)
-        # loss = huber_loss(q_values, q_target).mean(dim=1).sum(dim=0)
         return loss
 
     def update(self, batch: TensorBatch) -> Dict[str, float]:
@@ -428,7 +460,7 @@ class SACN:
 
         #  Target networks soft update
         with torch.no_grad():
-            soft_update(self.target_critic, self.critic, tau=self.tau)
+            soft_update(self.target_critic, self.critic, soft_target_update_rate=self.soft_target_update_rate)
             # for logging, Q-ensemble std estimate with the random actions:
             # a ~ U[-max_action, max_action]
             max_action = self.actor.max_action
@@ -469,220 +501,90 @@ class SACN:
         self.log_alpha.data[0] = state_dict["log_alpha"]
         self.alpha = self.log_alpha.exp().detach()
 
-
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.array(episode_rewards)
-
-
-def return_reward_range(dataset, max_episode_steps):
-    returns, lengths = [], []
-    ep_ret, ep_len = 0.0, 0
-    for r, d in zip(dataset["rewards"], dataset["terminals"]):
-        ep_ret += float(r)
-        ep_len += 1
-        if d or ep_len == max_episode_steps:
-            returns.append(ep_ret)
-            lengths.append(ep_len)
-            ep_ret, ep_len = 0.0, 0
-    lengths.append(ep_len)  # but still keep track of number of steps
-    assert sum(lengths) == len(dataset["rewards"])
-    return min(returns), max(returns)
-
-
-def modify_reward(dataset, env_name, max_episode_steps=1000):
-    if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
-        min_ret, max_ret = return_reward_range(dataset, max_episode_steps)
-        dataset["rewards"] /= max_ret - min_ret
-        dataset["rewards"] *= max_episode_steps
-    elif "antmaze" in env_name:
-        dataset["rewards"] -= 1.0
-
-# def corrupt_dynamics_func(d4rl_dataset, load_path, state_dim, action_dim, config):
-#     random_num = np.random.random(d4rl_dataset["rewards"].shape)
-#     indexs = np.where(random_num < config.corruption_rate)
-#     # save original next obs
-#     original_next_obs = d4rl_dataset["next_observations"][indexs].copy()
-#     obs_std = d4rl_dataset["next_observations"].std(axis=0)
-
-#     # adversarial attack dynamics
-#     observation = torch.from_numpy(original_next_obs.copy()).to(config.device)
-#     obs_std_torch = torch.from_numpy(obs_std.reshape(1, state_dim)).to(config.device)
-#     M = observation.shape[0]
-#     update_times, step_size = 10, 0.1
-#     actor_tmp = Actor(state_dim, action_dim, config.hidden_dim, config.max_action)
-#     actor_tmp.to(config.device)
-#     critic_tmp = VectorizedCritic(state_dim, action_dim, config.hidden_dim, config.num_critics)
-#     critic_tmp.to(config.device)
-#     state_dict = torch.load(load_path)
-#     actor_tmp.load_state_dict(state_dict["actor"])
-#     critic_tmp.load_state_dict(state_dict["critic"])
-
-#     def sample_random(size):
-#         return 2 * config.corruption_range * obs_std_torch * (torch.rand(size, state_dim, device=config.device) - 0.5) 
-
-#     def optimize_para(para, observation, loss_fun, update_times, step_size, eps, std):
-#         for i in range(update_times):
-#             para = torch.nn.Parameter(para.clone(), requires_grad=True)
-#             optimizer = torch.optim.Adam([para], lr=step_size * eps) 
-#             loss = loss_fun(observation, para)
-#             # print(loss.mean().detach().cpu())
-#             # optimize noised obs
-#             optimizer.zero_grad()
-#             loss.mean().backward()
-#             optimizer.step()
-#             para = torch.maximum(torch.minimum(para, eps * std), -eps * std).detach()
-#         return para 
-
-#     def _loss_Q(observation, para):
-#         noised_obs = observation + para
-#         pred_actions = actor_tmp(noised_obs,  deterministic=True)[0]
-#         return critic_tmp(observation, pred_actions) 
-
-#     split = 10
-#     attack_obs = np.zeros((M, state_dim))
-#     pointer = 0
-#     for i in range(split):
-#         number = M // split if i < split -1 else M - pointer
-#         temp_obs = observation[pointer:pointer + number]
-#         para = sample_random(number).reshape(-1, state_dim)
-#         para = optimize_para(para, temp_obs, _loss_Q, update_times, step_size, config.corruption_range, obs_std_torch)
-#         noise_obs_final = para.detach()
-#         ### replace data in replay buffer with noise_obs_final
-#         # d4rl_dataset["next_observations"][indexs[0][i*split:i*split + number]] = noise_obs_final.cpu().numpy().reshape(-1, state_dim)
-#         attack_obs[pointer:pointer + number] = noise_obs_final.cpu().numpy().reshape(-1, state_dim) + temp_obs.cpu().numpy().reshape(-1, state_dim)
-#         pointer += number
-    
-#     # clear gpu cache
-#     critic_tmp.to('cpu')
-#     actor_tmp.to('cpu')
-#     torch.cuda.empty_cache()
-#     ### save data
-#     save_dict = {}
-#     save_dict['index'] = indexs
-#     save_dict['next_observations'] = attack_obs 
-#     path = os.path.join('./log_attack_data/walker2d_new_diverse/', "attack_data_corrupt{}_rate{}.pt".format(config.corruption_range, config.corruption_rate))
-#     if not os.path.exists('./log_attack_data/walker2d_new_diverse/'):
-#         os.makedirs(path)
-#     torch.save(save_dict,path)
     
 
 
 # @pyrallis.wrap()
 def train(config: TrainConfig):
-    set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
+    # Set seeds
+    env = gym.make(config.env_name)
+    seed = config.train_seed
+    set_seed(seed, env)
     wandb_init(asdict(config))
 
-    # data, evaluation, env setup
-    eval_env = wrap_env(gym.make(config.env_name))
-    state_dim = eval_env.observation_space.shape[0]
-    action_dim = eval_env.action_space.shape[0]
+    # env setup
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
 
-    dataset = d4rl.qlearning_dataset(eval_env)
-
-    if config.normalize_reward:
-        modify_reward(dataset, config.env_name)
+    dataset = d4rl.qlearning_dataset(env)
 
     ##### corrupt
-    if (config.corruption_reward or config.corruption_dynamics or config.corruption_obs or config.corruption_acts):
-        if config.random_corruption:
-            print('random corruption')
-            random_num = np.random.random(dataset["rewards"].shape)
-            indexs = np.where(random_num < config.corruption_rate)
+    if (config.corrupt_reward or config.corrupt_dynamics or config.corrupt_obs or config.corrupt_acts):
+        dataset, indexes = attack_dataset(config, dataset)
 
-            ##### attack indexes
-            # attack_indexes[indexs] = 1.0
+    if config.normalize:
+        state_mean, state_std = compute_mean_std(np.concatenate([dataset["observations"], dataset['next_observations']], axis=0), eps=1e-3)
+    else:
+        state_mean, state_std = 0, 1
 
-            if config.corruption_dynamics: # corrupt dynamics
-                print('attack dynamics')
-                std = dataset["next_observations"].std(axis=0).reshape(1,state_dim)
-                dataset["next_observations"][indexs] += \
-                            np.random.uniform(-config.corruption_range, config.corruption_range, size=(indexs[0].shape[0], state_dim)) * std
-            
-            if config.corruption_reward: # corrupt rewards
-                print('attack reward')
-                dataset["rewards"][indexs] = \
-                            np.random.uniform(-config.corruption_range, config.corruption_range, size=indexs[0].shape[0])
-            
-            if config.corruption_obs:
-                print('attack observation')
-                std = dataset["observations"].std(axis=0).reshape(1,state_dim)
-                dataset["observations"][indexs] += np.random.uniform(-config.corruption_range, config.corruption_range, size=(indexs[0].shape[0], state_dim)) * std
-            
-            if config.corruption_acts:
-                print('attack actions')
-                std = dataset['actions'].std(axis=0).reshape(1, action_dim)
-                dataset["actions"][indexs] += np.random.uniform(-config.corruption_range, config.corruption_range, size=(indexs[0].shape[0], action_dim)) * std
+    print('state mean: ', state_mean)
+    print('state std: ', state_std)
 
-        else:
-            print('adversarial corruption')
-            import pdb;pdb.set_trace()
-
-    buffer = ReplayBuffer(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        buffer_size=config.buffer_size,
-        device=config.device,
+    dataset["observations"] = normalize_states(
+        dataset["observations"], state_mean, state_std
     )
-    buffer.load_d4rl_dataset(dataset)
-
-    # Actor & Critic setup
-    actor = Actor(state_dim, action_dim, config.hidden_dim, config.max_action)
-    actor.to(config.device)
-    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_learning_rate)
-    critic = VectorizedCritic(
-        state_dim, action_dim, config.hidden_dim, config.num_critics
-    )
-    critic.to(config.device)
-    critic_optimizer = torch.optim.Adam(
-        critic.parameters(), lr=config.critic_learning_rate
+    dataset["next_observations"] = normalize_states(
+        dataset["next_observations"], state_mean, state_std
     )
 
-    trainer = SACN(
-        actor=actor,
-        actor_optimizer=actor_optimizer,
-        critic=critic,
-        critic_optimizer=critic_optimizer,
-        gamma=config.gamma,
-        tau=config.tau,
-        alpha_learning_rate=config.alpha_learning_rate,
-        LCB_ratio=config.LCB_ratio,
-        target_LCB_ratio=config.target_LCB_ratio,
-        imitation_ratio=config.imitation_ratio,
-        device=config.device,
+    env = wrap_env(env, state_mean=state_mean, state_std=state_std)
+    replay_buffer = ReplayBuffer(
+        state_dim,
+        action_dim,
+        config.buffer_size,
+        config.device,
     )
-    # saving config to the checkpoint
+    replay_buffer.load_d4rl_dataset(dataset)
+    max_action = float(env.action_space.high[0])
+
     if config.checkpoints_path is not None:
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
             pyrallis.dump(config, f)
 
+    # Actor & Critic setup
+    actor = Actor(state_dim, action_dim, config.hidden_dim, max_action).to(config.device)
+    critic = VectorizedCritic(
+        state_dim, action_dim, config.hidden_dim, config.num_critics
+    ).to(config.device)
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_learning_rate)
+    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=config.critic_learning_rate)
+
+    print("---------------------------------------")
+    print(f"Training MSG, Env: {config.env_name}, Seed: {seed}")
+    print("---------------------------------------")
+
+
+    trainer = MSG(
+        actor=actor,
+        actor_optimizer=actor_optimizer,
+        critic=critic,
+        critic_optimizer=critic_optimizer,
+        discount=config.discount,
+        soft_target_update_rate=config.soft_target_update_rate,
+        alpha_learning_rate=config.alpha_learning_rate,
+        LCB_ratio=config.LCB_ratio,
+        device=config.device,
+    )
+
     total_updates = 0.0
     for epoch in trange(config.num_epochs, desc="Training"):
-        # training
         for _ in trange(config.num_updates_on_epoch, desc="Epoch", leave=False):
-            batch = buffer.sample(config.batch_size)
+            batch = replay_buffer.sample(config.batch_size)
             update_info = trainer.update(batch)
 
             if total_updates % config.log_every == 0:
-                # if trainer.use_UW:
-                #     update_info['average uncertainty'] = np.mean(trainer.uncertainty.detach().cpu().numpy())
                 wandb.log({"epoch": epoch, **update_info})
 
             total_updates += 1
@@ -691,7 +593,7 @@ def train(config: TrainConfig):
         # evaluation
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
             eval_returns = eval_actor(
-                env=eval_env,
+                env=env,
                 actor=actor,
                 n_episodes=config.eval_episodes,
                 seed=config.eval_seed,
@@ -702,8 +604,8 @@ def train(config: TrainConfig):
                 "eval/reward_std": np.std(eval_returns),
                 "epoch": epoch,
             }
-            if hasattr(eval_env, "get_normalized_score"):
-                normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
+            if hasattr(env, "get_normalized_score"):
+                normalized_score = env.get_normalized_score(eval_returns) * 100.0
                 eval_log["eval/normalized_score_mean"] = np.mean(normalized_score)
                 eval_log["eval/normalized_score_std"] = np.std(normalized_score)
 
@@ -723,50 +625,49 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', type=str, default='halfcheetah-medium-v2')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--corruption_reward', action='store_true', default=False)
-    parser.add_argument('--corruption_dynamics', action='store_true', default=False)
-    parser.add_argument('--corruption_acts', action='store_true', default=False)
-    parser.add_argument('--corruption_obs', action='store_true', default=False)
-    parser.add_argument('--random_corruption', action='store_true', default=False)
-    parser.add_argument('--corruption_range', type=float, default=0.3)
-    parser.add_argument('--corruption_rate', type=float, default=0.1)
+    parser.add_argument('--corrupt_reward', action='store_true', default=False)
+    parser.add_argument('--corrupt_dynamics', action='store_true', default=False)
+    parser.add_argument('--corrupt_acts', action='store_true', default=False)
+    parser.add_argument('--corrupt_obs', action='store_true', default=False)
+    parser.add_argument('--corruption_mode', type=str, default='random')
+    parser.add_argument('--corruption_range', type=float, default=0.0)
+    parser.add_argument('--corruption_rate', type=float, default=0.0)
+    parser.add_argument('--checkpoints_path', type=str, default=None)
     args = parser.parse_args()
     print(args)
 
     ### modify config
     TrainConfig.env_name = args.env_name
     TrainConfig.train_seed = args.seed
-    TrainConfig.corruption_reward = args.corruption_reward
-    TrainConfig.corruption_dynamics = args.corruption_dynamics
-    TrainConfig.corruption_acts = args.corruption_acts
-    TrainConfig.corruption_obs = args.corruption_obs
-    TrainConfig.random_corruption = args.random_corruption
+    TrainConfig.corrupt_reward = args.corrupt_reward
+    TrainConfig.corrupt_dynamics = args.corrupt_dynamics
+    TrainConfig.corrupt_acts = args.corrupt_acts
+    TrainConfig.corrupt_obs = args.corrupt_obs
+    TrainConfig.corruption_mode = args.corruption_mode
     TrainConfig.corruption_range = args.corruption_range
     TrainConfig.corruption_rate = args.corruption_rate
+    TrainConfig.checkpoints_path = args.checkpoints_path
 
 
     ## modify config
-    if TrainConfig.corruption_reward:
+    if TrainConfig.corrupt_reward:
         group_name_center = 'reward' 
-    elif TrainConfig.corruption_dynamics:
+    elif TrainConfig.corrupt_dynamics:
         group_name_center = 'dynamics'
-    elif TrainConfig.corruption_acts:
+    elif TrainConfig.corrupt_acts:
         group_name_center = 'actions'
-    else:
+    elif TrainConfig.corrupt_obs:
         group_name_center = 'observations'
+    else:
+        group_name_center = 'no_attack'
 
 
-    ## modify config
-    group_name_center = 'random_' + group_name_center if TrainConfig.random_corruption else 'adversarial_' + group_name_center
-    TrainConfig.group = TrainConfig.group + '-{}'.format(group_name_center) 
-    TrainConfig.group = TrainConfig.group + '_{}'.format(TrainConfig.env_name.split('-')[0])
-    
-    name = "MSG_corrupt{}_{}_QLCB{}_seed{}".format(TrainConfig.corruption_range, TrainConfig.corruption_rate, TrainConfig.LCB_ratio, TrainConfig.train_seed)
-    
-    TrainConfig.name = f"{name}-{TrainConfig.env_name}-{str(uuid.uuid4())[:8]}"
+    group_name_center = '{}_'.format(TrainConfig.corruption_mode) + group_name_center 
+    TrainConfig.group = TrainConfig.group + '-{}'.format(group_name_center) + '_{}'.format(TrainConfig.env_name.split('-')[0])
+    TrainConfig.name = "MSG_corrupt{}_{}_baseline_seed{}".format(TrainConfig.corruption_range, TrainConfig.corruption_rate, TrainConfig.train_seed)
+    TrainConfig.name = f"{TrainConfig.name}-{TrainConfig.env_name}-{str(uuid.uuid4())[:8]}"
     if TrainConfig.checkpoints_path is not None:
-        TrainConfig.checkpoints_path = os.path.join(TrainConfig.checkpoints_path, TrainConfig.name)
+        TrainConfig.checkpoints_path = os.path.join(TrainConfig.checkpoints_path, TrainConfig.group, TrainConfig.name)
     
     train(TrainConfig)
-
 
