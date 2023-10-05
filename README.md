@@ -29,7 +29,7 @@ CUDA_VISIBLE_DEVICES=${gpu} python RIQL.py --corruption_mode adversarial --corru
 The adversarial attacks on obs, actions, and next-obs require performing gradient-based attack and will save the corrupted data. After saving the corrupted data, we will load these data for later training.
 
 
-## Clean Data
+### Clean Data
 To run the algorithm with a clean dataset, you can run the following command without specifying the corruption-related parameters
 ```bash
 CUDA_VISIBLE_DEVICES=${gpu} python RIQL.py  --env_name ${env_name} --seed ${seed} 
@@ -37,7 +37,7 @@ CUDA_VISIBLE_DEVICES=${gpu} python RIQL.py  --env_name ${env_name} --seed ${seed
 
 
 
-## Baselines
+### Baselines
 You can replace the RIQL.py with other baselines, such as IQL.py, CQL.py, EDAC.py, and MSG.py, to run IQL, CQL, EDAC, and MSG. 
 
 
