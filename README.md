@@ -13,9 +13,9 @@ Run RIQL with random observation corruption:
 ```bash
 CUDA_VISIBLE_DEVICES=${gpu} python RIQL.py --corruption_mode random  --corrupt_obs --corruption_range ${corruption_range} --corruption_rate ${corruption_rate}  --env_name ${env_name} --seed ${seed} 
 ```
-\${env_name}\$ can be 'halfcheetah-medium-replay-v2',  'walker2d-medium-replay-v2', 'hopper-medium-replay-v2', .... 
+'env_name' can be 'halfcheetah-medium-replay-v2',  'walker2d-medium-replay-v2', 'hopper-medium-replay-v2', .... 
 
-\${corruption\_range}\$ and \${corruption\_rate}\$ are set to 1.0 and 0.3 by default. 
+'corruption\_range' and 'corruption\_rate' are set to 1.0 and 0.3 by default. 
 
 Replace '--corrupt_obs' with '--corrupt_reward', '--corrupt_acts', and '--corrupt_dynamics' to enforce corruption on rewards, actions, and dynamics.
 
