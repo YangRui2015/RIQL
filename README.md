@@ -1,14 +1,14 @@
 # Towards Robust Offline RL under Diverse Data Corruption
 
-This repo contains the official implemented Robust IQL (RIQL) algorithm for the paper "Towards Robust Offline RL under Diverse Data Corruption". This code is implemented based on the CORL library (Research-oriented Deep Offline Reinforcement Learning Library).
+This repo contains the official implemented Robust IQL (RIQL) algorithm for the **ICLR 2024 spotlight paper** (⭐ top 5%), "Towards Robust Offline RL under Diverse Data Corruption". This code is implemented based on the open-sourced [CORL library](https://github.com/tinkoff-ai/CORL).
 
 
 
 ## Getting started
-Install torch>=1.7.1, gym, mujoco_py, d4rl, pyrallis, wandb, tqdm
+Install torch>=1.7.1, gym, mujoco_py, d4rl, pyrallis, wandb, tqdm.
 
 
-### Under Random Attack
+### Under Random Data Corruption
 Run RIQL with random observation corruption:
 ```bash
 CUDA_VISIBLE_DEVICES=${gpu} python RIQL.py --corruption_mode random  --corrupt_obs --corruption_range ${corruption_range} --corruption_rate ${corruption_rate}  --env_name ${env_name} --seed ${seed} 
@@ -19,7 +19,7 @@ CUDA_VISIBLE_DEVICES=${gpu} python RIQL.py --corruption_mode random  --corrupt_o
 
 Replace '--corrupt_obs' with '--corrupt_reward', '--corrupt_acts', and '--corrupt_dynamics' to enforce corruption on rewards, actions, and dynamics.
 
-### Under Adversarial Attack
+### Under Adversarial Data Corruption
 
 Run RIQL with adversarial observation corruption:
 ```bash
@@ -36,9 +36,22 @@ CUDA_VISIBLE_DEVICES=${gpu} python RIQL.py  --env_name ${env_name} --seed ${seed
 ```
 
 
-
 ### Baselines
 You can replace the RIQL.py with other baselines, such as IQL.py, CQL.py, EDAC.py, and MSG.py, to run IQL, CQL, EDAC, and MSG. 
+
+
+
+## Citation
+If you find our work helpful for your research, please cite:
+```
+@article{yang2023towards,
+  title={What is Essential for Unseen Goal Generalization of Offline Goal-conditioned RL?},
+  author={Yang, Rui and Zhong, Han and Xu, Jiawei and Zhang, Amy and Zhang, Chongjie and Han, Lei and Zhang, Tong},
+  booktitle={International Conference on Machine Learning},
+  year={2023}
+}
+```
+
 
 
 
