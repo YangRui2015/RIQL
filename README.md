@@ -1,6 +1,6 @@
 # Towards Robust Offline RL under Diverse Data Corruption
 
-This repo contains the official implemented Robust IQL (RIQL) algorithm for the **ICLR 2024 spotlight paper** (⭐ top 5%), "Towards Robust Offline RL under Diverse Data Corruption". This code is implemented based on the open-sourced [CORL library](https://github.com/tinkoff-ai/CORL).
+This repo contains the official implemented Robust IQL (RIQL) algorithm for the **ICLR 2024 spotlight paper** (⭐ top 5%), "Towards Robust Offline Reinforcement Learning under Diverse Data Corruption". This code is implemented based on the open-sourced [CORL library](https://github.com/tinkoff-ai/CORL).
 
 
 
@@ -45,7 +45,7 @@ You can replace the RIQL.py with other baselines, such as IQL.py, CQL.py, EDAC.p
 If you find our work helpful for your research, please cite:
 ```
 @article{yang2023towards,
-  title={What is Essential for Unseen Goal Generalization of Offline Goal-conditioned RL?},
+  title={Towards Robust Offline Reinforcement Learning under Diverse Data Corruption},
   author={Yang, Rui and Zhong, Han and Xu, Jiawei and Zhang, Amy and Zhang, Chongjie and Han, Lei and Zhang, Tong},
   booktitle={International Conference on Machine Learning},
   year={2023}
