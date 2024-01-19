@@ -44,14 +44,14 @@ You can replace the RIQL.py with other baselines, such as IQL.py, CQL.py, EDAC.p
 ## Citation
 If you find our work helpful for your research, please cite:
 ```
-@article{yang2023towards,
+@inproceedings{yang2023towards,
   title={Towards Robust Offline Reinforcement Learning under Diverse Data Corruption},
   author={Yang, Rui and Zhong, Han and Xu, Jiawei and Zhang, Amy and Zhang, Chongjie and Han, Lei and Zhang, Tong},
-  booktitle={International Conference on Machine Learning},
-  year={2023}
+  booktitle={The Twelfth International Conference on Learning Representations},
+  year={2024},
+  url={https://openreview.net/forum?id=5hAMmCU0bK}
 }
 ```
-
 
 
 
