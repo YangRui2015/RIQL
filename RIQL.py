@@ -61,7 +61,7 @@ class TrainConfig:
     learning_rate: float = 3e-4  # Learning rate for all networks
     beta: float = 3.0  # Inverse temperature. Small beta -> BC, big beta -> maximizing Q
     iql_tau: float = 0.7  # Coefficient for asymmetric loss
-    iql_deterministic: bool = False  # Use deterministic actor
+    iql_deterministic: bool = True  # Use deterministic actor, if False use Gaussian (perform slightly worse)
     normalize: bool = True  # Normalize observation
     # Wandb logging
     project: str = "Robust_Offline_RL"

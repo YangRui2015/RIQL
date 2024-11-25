@@ -2,6 +2,8 @@
 
 This repo contains the official implemented Robust IQL (RIQL) algorithm for the **ICLR 2024 spotlight paper** (⭐ top 5%), <ins>"Towards Robust Offline Reinforcement Learning under Diverse Data Corruption"</ins>. This code is implemented based on the open-sourced [CORL library](https://github.com/tinkoff-ai/CORL).
 
+### Note
+We fixed a small bug and ensured setting `iql_deterministic=True` as the default hyperparameter in our experiments, which is more stable and generally performs better. We have discussed the deterministic policy in Appendix E.4 of our paper.
 
 
 ## Getting started
